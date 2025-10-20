@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from scanner.result import Finding, ScanResult
 from scanner.severity import Severity
@@ -103,25 +103,42 @@ class VpcEgressRule:
         return subnets
 
     def _collect_routes(self, resources: Dict[str, Any]) -> Dict[str, List[RouteMetadata]]:
-        routes: Dict[str, List[RouteMetadata]] = {}
+        routes_by_table: Dict[str, List[RouteMetadata]] = {}
+        associations: Dict[str, Set[str]] = {}
+
         for logical_id, resource in resources.items():
-            if resource.get("Type") != "AWS::EC2::Route":
-                continue
-            props = resource.get("Properties", {})
-            route_table_id = props.get("RouteTableId")
-            if isinstance(route_table_id, dict):
-                continue
-            destination = props.get("DestinationCidrBlock")
-            target_type = ""
-            if props.get("GatewayId"):
-                target_type = "igw"
-            elif props.get("NatGatewayId"):
-                target_type = "nat"
-            elif props.get("TransitGatewayId"):
-                target_type = "tgw"
-            if destination and isinstance(destination, str):
-                routes.setdefault(route_table_id, []).append(RouteMetadata(destination, target_type))
-        return routes
+            resource_type = resource.get("Type")
+            if resource_type == "AWS::EC2::Route":
+                props = resource.get("Properties", {})
+                route_table_id = self._normalize_reference(props.get("RouteTableId"))
+                if not route_table_id:
+                    continue
+                destination = props.get("DestinationCidrBlock")
+                if not isinstance(destination, str):
+                    continue
+                target_type = ""
+                if props.get("GatewayId"):
+                    target_type = "igw"
+                elif props.get("NatGatewayId"):
+                    target_type = "nat"
+                elif props.get("TransitGatewayId"):
+                    target_type = "tgw"
+                routes_by_table.setdefault(route_table_id, []).append(RouteMetadata(destination, target_type))
+            elif resource_type == "AWS::EC2::SubnetRouteTableAssociation":
+                props = resource.get("Properties", {})
+                subnet_id = self._normalize_reference(props.get("SubnetId"))
+                route_table_id = self._normalize_reference(props.get("RouteTableId"))
+                if subnet_id and route_table_id:
+                    associations.setdefault(subnet_id, set()).add(route_table_id)
+
+        subnet_routes: Dict[str, List[RouteMetadata]] = {}
+        for subnet_id, table_ids in associations.items():
+            collected: List[RouteMetadata] = []
+            for table_id in table_ids:
+                collected.extend(routes_by_table.get(table_id, []))
+            subnet_routes[subnet_id] = collected
+
+        return subnet_routes
 
     def _collect_security_groups(self, resources: Dict[str, Any]) -> Dict[str, List[SecurityGroupRule]]:
         sg_rules: Dict[str, List[SecurityGroupRule]] = {}
@@ -268,14 +285,7 @@ class VpcEgressRule:
 
     def _ensure_list(self, value: Any) -> List[str]:
         def _coerce(item: Any) -> Optional[str]:
-            if isinstance(item, str):
-                return item
-            if isinstance(item, dict):
-                if "Ref" in item and isinstance(item["Ref"], str):
-                    return item["Ref"]
-                if "Fn::GetAtt" in item and isinstance(item["Fn::GetAtt"], list):
-                    return ".".join(str(part) for part in item["Fn::GetAtt"])
-            return None
+            return self._normalize_reference(item)
 
         if value is None:
             return []
@@ -284,6 +294,18 @@ class VpcEgressRule:
             return [item for item in coerced if item]
         coerced_single = _coerce(value)
         return [coerced_single] if coerced_single else []
+
+    def _normalize_reference(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            if "Ref" in value and isinstance(value["Ref"], str):
+                return value["Ref"]
+            if "Fn::GetAtt" in value and isinstance(value["Fn::GetAtt"], list):
+                return ".".join(str(part) for part in value["Fn::GetAtt"])
+        return None
 
 
 def get_rule() -> Rule:
