@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Guardrails pipeline (Source -> Build -> Approval -> Deploy).
+
+Parameters:
+  SourceProvider:
+    Type: String
+    AllowedValues:
+      - CodeCommit
+      - GitHub
+    Default: CodeCommit
+    Description: Select CodeCommit or GitHub (CodeStar connection) for the source stage.
+  CodeCommitRepositoryName:
+    Type: String
+    Default: ServerlessGuardrails
+    Description: CodeCommit repository name (used when SourceProvider=CodeCommit).
+  CodeCommitBranch:
+    Type: String
+    Default: main
+    Description: Branch to track when using CodeCommit.
+  GitHubConnectionArn:
+    Type: String
+    Default: ''
+    Description: CodeStar connection ARN for GitHub (required when SourceProvider=GitHub).
+  GitHubOwner:
+    Type: String
+    Default: ''
+    Description: GitHub organization or user (required when SourceProvider=GitHub).
+  GitHubRepo:
+    Type: String
+    Default: ''
+    Description: GitHub repository name (required when SourceProvider=GitHub).
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch to track when SourceProvider=GitHub.
+  PipelineArtifactBucketName:
+    Type: String
+    Description: Existing S3 bucket for pipeline artifacts.
+  ScanFailOn:
+    Type: String
+    AllowedValues:
+      - CRITICAL
+      - HIGH
+      - MEDIUM
+      - LOW
+      - INFO
+    Default: MEDIUM
+    Description: Highest severity threshold that will fail the pipeline.
+  ApprovalSNSTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional SNS topic ARN for manual approval notifications.
+  GuidanceUrl:
+    Type: String
+    Default: https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/security.html
+    Description: Link shared in approval and hook messages for remediation guidance.
+
+Conditions:
+  UseGitHub: !Equals [!Ref SourceProvider, GitHub]
+  UseCodeCommit: !Equals [!Ref SourceProvider, CodeCommit]
+  HasApprovalTopic: !Not [!Equals [!Ref ApprovalSNSTopicArn, '']]
+
+Resources:
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: BuildArtifactsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${PipelineArtifactBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${PipelineArtifactBucketName}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStacks
+                  - cloudformation:GetTemplate
+                Resource: '*'
+
+  ScannerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: ServerlessGuardrails-Scanner
+      Description: Runs tests and scanner to produce findings JSON.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: FAIL_ON
+            Value: !Ref ScanFailOn
+          - Name: GUIDANCE_URL
+            Value: !Ref GuidanceUrl
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec.yml
+      TimeoutInMinutes: 20
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: PipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt ScannerBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${PipelineArtifactBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${PipelineArtifactBucketName}/*
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CodeBuildRole.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !If [HasApprovalTopic, !Ref ApprovalSNSTopicArn, !Ref AWS::NoValue]
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt PreDeployHookFunction.Arn
+                  - !GetAtt PostDeployHookFunction.Arn
+
+  HookFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: HookExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${PipelineArtifactBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${PipelineArtifactBucketName}/*
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStackResources
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+
+  PreDeployHookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../hooks/
+      Handler: pre_deploy_hook.handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt HookFunctionRole.Arn
+      Environment:
+        Variables:
+          GUIDE_URL: !Ref GuidanceUrl
+
+  PostDeployHookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../hooks/
+      Handler: post_deploy_hook.handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt HookFunctionRole.Arn
+      Environment:
+        Variables:
+          GUIDE_URL: !Ref GuidanceUrl
+          STACK_NAME: serverless-guardrails-demo
+
+  DeploymentPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucketName
+      Variables:
+        - Name: ScanFailOn
+          Value: !Ref ScanFailOn
+        - Name: GuidanceUrl
+          Value: !Ref GuidanceUrl
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: !If [UseGitHub, CodeStarSourceConnection, CodeCommit]
+                Version: !If [UseGitHub, '1', '1']
+              Configuration: !If
+                - UseGitHub
+                - {
+                    ConnectionArn: !Ref GitHubConnectionArn,
+                    FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}',
+                    BranchName: !Ref GitHubBranch,
+                    DetectChanges: true
+                  }
+                - {
+                    RepositoryName: !Ref CodeCommitRepositoryName,
+                    BranchName: !Ref CodeCommitBranch,
+                    PollForSourceChanges: true
+                  }
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: StaticScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ScannerBuildProject
+                EnvironmentVariables: >-
+                  [{"name":"FAIL_ON","value":"#{Variables.ScanFailOn}","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: PreDeploy
+          Actions:
+            - Name: PreDeployValidation
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref PreDeployHookFunction
+              InputArtifacts:
+                - Name: BuildOutput
+        - Name: Approval
+          Actions:
+            - Name: ManualGate
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: |
+                  Automated scan passed. Review artifacts/scan.json and artifacts/approval_message.txt for highlights.
+                  Remediation guide: #{Variables.GuidanceUrl}
+                NotificationArn: !If [HasApprovalTopic, !Ref ApprovalSNSTopicArn, !Ref AWS::NoValue]
+        - Name: Deploy
+          Actions:
+            - Name: DeploySAM
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: serverless-guardrails-demo
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM
+                TemplatePath: SourceOutput::templates/app-sam.yaml
+                ChangeSetName: guardrails-changeset
+              InputArtifacts:
+                - Name: SourceOutput
+        - Name: PostDeploy
+          Actions:
+            - Name: PostDeployValidation
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref PostDeployHookFunction
+
+
+Outputs:
+  PipelineName:
+    Description: Name of the created CodePipeline.
+    Value: !Ref DeploymentPipeline
+  BuildProjectName:
+    Description: CodeBuild project executing the scanner.
+    Value: !Ref ScannerBuildProject

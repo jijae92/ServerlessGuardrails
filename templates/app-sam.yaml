@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Demo stack highlighting secure vs insecure Lambda configurations.
+
+Parameters:
+  VpcId:
+    Type: String
+    Default: vpc-0123456789abcdef0
+  SafeSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:us-east-1:111111111111:secret:serverless/guardrails-safe
+
+Resources:
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-a
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-a
+        - Key: Network
+          Value: Private
+
+  OpenEgressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all outbound traffic
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  RestrictedEgressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Restrict outbound traffic to Secrets Manager endpoint
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.100.10/32
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+      SecurityGroupIds:
+        - !Ref RestrictedEgressSecurityGroup
+
+  VulnerableFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../functions/vulnerable/
+      Handler: app.handler
+      Runtime: python3.11
+      Description: Insecure Lambda with hardcoded secrets, broad IAM policy, and open egress.
+      Environment:
+        Variables:
+          API_KEY: sk_live_demo_1234567890_SECRET
+          SECRET_TOKEN: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.VGVzdFNlc3Npb24uSXNzdWVy.R29vZFNpZ25hdHVyZQ
+      Policies:
+        - PolicyName: InsecurePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:*
+                Resource: "*"
+      VpcConfig:
+        SubnetIds:
+          - !Ref PublicSubnetA
+        SecurityGroupIds:
+          - !Ref OpenEgressSecurityGroup
+
+  SafeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../functions/safe/
+      Handler: app.handler
+      Runtime: python3.11
+      Description: Hardened Lambda that resolves secrets at runtime with least privilege.
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref SafeSecretArn
+      Policies:
+        - PolicyName: LeastPrivilegeLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/SafeFunction:*
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+        SecurityGroupIds:
+          - !Ref RestrictedEgressSecurityGroup
+
+Outputs:
+  VulnerableFunctionName:
+    Description: Name of the vulnerable function.
+    Value: !Ref VulnerableFunction
+  SafeFunctionName:
+    Description: Name of the safe function.
+    Value: !Ref SafeFunction

@@ -1,0 +1,93 @@
+version: 0.2
+env:
+  variables:
+    FAIL_ON: MEDIUM
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - pip install --upgrade pip
+  pre_build:
+    commands:
+      - pip install -r requirements.txt
+      - python pipeline/scripts/validate_allowlist.py
+      - PYTHONPATH=. pytest --cov=scanner --cov-report=term-missing --cov-report=xml --cov-fail-under=80
+  build:
+    commands:
+      - mkdir -p artifacts
+      - python -m scanner --template templates/app-sam.yaml --source functions/vulnerable --format json --out artifacts/scan.json
+  post_build:
+    commands:
+      - python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+SEVERITY_LEVEL = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+
+path = Path("artifacts/scan.json")
+if not path.exists():
+    raise SystemExit("scan.json missing")
+
+report = json.loads(path.read_text(encoding="utf-8"))
+summary = {key.upper(): value for key, value in report.get("summary", {}).items()}
+
+def top_findings(limit: int = 10) -> list[str]:
+    findings = report.get("findings", [])
+    ordered = sorted(
+        findings,
+        key=lambda item: ORDER.index(item.get("severity", "INFO")) if item.get("severity") in ORDER else len(ORDER),
+    )
+    highlights = []
+    for item in ordered[:limit]:
+        highlights.append(
+            f"[{item.get('severity')}] {item.get('id')} {item.get('title')} -> {item.get('resource')} ({item.get('path')})"
+        )
+    return highlights
+
+print("--- Scanner Summary ---")
+for severity in ORDER:
+    print(f"{severity:<9}: {summary.get(severity, 0)}")
+print(f"PASSED   : {report.get('passed')}")
+
+message_lines = [
+    "Automated scan summary:",
+    json.dumps(summary, indent=2),
+    "Top findings:",
+]
+for highlight in top_findings():
+    message_lines.append(f"- {highlight}")
+message_lines.append("Remediation guide: https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/security.html")
+Path("artifacts/approval_message.txt").write_text("\n".join(message_lines), encoding="utf-8")
+
+fail_on = os.environ.get("FAIL_ON", "MEDIUM").upper()
+if fail_on not in SEVERITY_LEVEL:
+    fail_on = "MEDIUM"
+threshold_level = SEVERITY_LEVEL[fail_on]
+
+highest_level = -1
+highest_severity = None
+for severity in ORDER:
+    if summary.get(severity, 0):
+        level = SEVERITY_LEVEL[severity]
+        if level > highest_level:
+            highest_level = level
+            highest_severity = severity
+
+exit_code = 0
+if highest_severity is not None and highest_level >= threshold_level:
+    if highest_level >= SEVERITY_LEVEL["HIGH"]:
+        exit_code = 2
+    elif highest_level == SEVERITY_LEVEL["MEDIUM"]:
+        exit_code = 1
+
+print(f"Exit code selected: {exit_code} (threshold={fail_on})")
+raise SystemExit(exit_code)
+PY
+artifacts:
+  files:
+    - artifacts/scan.json
+    - artifacts/approval_message.txt
+  discard-paths: no

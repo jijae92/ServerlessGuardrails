@@ -1,0 +1,113 @@
+name: Serverless Guardrails CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    env:
+      FAIL_ON: MEDIUM
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate allowlist expiry
+        run: |
+          python pipeline/scripts/validate_allowlist.py
+
+      - name: Run unit tests with coverage
+        run: |
+          PYTHONPATH=. pytest --cov=scanner --cov-report=term-missing --cov-report=xml --cov-fail-under=80
+
+      - name: Run scanner
+        run: |
+          mkdir -p artifacts
+          python -m scanner --template templates/app-sam.yaml --source functions/vulnerable --format json --out artifacts/scan.json
+
+      - name: Summarize findings
+        id: summarize
+        run: |
+          python - <<'PY'
+import json
+from pathlib import Path
+
+ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+scan = json.loads(Path("artifacts/scan.json").read_text(encoding="utf-8"))
+summary = scan.get("summary", {})
+passed = scan.get("passed", False)
+findings = scan.get("findings", [])
+ordered = sorted(
+    findings,
+    key=lambda item: ORDER.index(item.get("severity", "INFO")) if item.get("severity") in ORDER else len(ORDER),
+)
+lines = ["## Serverless Guardrails Scan", f"**Passed:** {passed}"]
+lines.append("```")
+for sev in ORDER:
+    lines.append(f"{sev:<9}: {summary.get(sev.lower(), summary.get(sev, 0))}")
+lines.append("```")
+if ordered:
+    lines.append("**Top Findings:**")
+    for item in ordered[:10]:
+        lines.append(f"- [{item.get('severity')}] {item.get('id')} {item.get('title')} → {item.get('resource')} ({item.get('path')})")
+lines.append("Remediation guide: https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/security.html")
+comment = "\n".join(lines)
+Path("artifacts/scan_comment.md").write_text(comment, encoding="utf-8")
+PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-artifacts
+          path: artifacts/
+
+      - name: Comment on pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('artifacts/scan_comment.md', 'utf-8');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Fail on high severity
+        run: |
+          python - <<'PY'
+import json
+import os
+from pathlib import Path
+levels = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+scan = json.loads(Path("artifacts/scan.json").read_text(encoding="utf-8"))
+summary = scan.get("summary", {})
+fail_on = os.environ.get("FAIL_ON", "MEDIUM").upper()
+threshold = levels.get(fail_on, 2)
+highest = 0
+for sev, lvl in levels.items():
+    count = summary.get(sev.lower(), summary.get(sev, 0))
+    if count and lvl > highest:
+        highest = lvl
+if highest >= levels["HIGH"]:
+    raise SystemExit("CRITICAL/HIGH findings detected")
+elif highest >= levels["MEDIUM"] and highest >= threshold:
+    raise SystemExit("MEDIUM findings detected and threshold met")
+PY
